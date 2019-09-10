@@ -5,6 +5,7 @@
 import numpy as np
 from librosa import resample, time_to_frames
 
+from .. import base
 from ..base import Scope
 from ..exceptions import ParameterError
 
@@ -134,7 +135,10 @@ class FeatureExtractor(Scope):
         return L
 
     def layers_keras(self):
-        from keras.layers import Input
+        if base.USE_TF_KERAS:
+            from tensorflow.keras.layers import Input
+        else:
+            from keras.layers import Input
 
         L = dict()
         for key in self.fields:

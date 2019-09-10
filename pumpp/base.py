@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 '''Base class definitions'''
-
+import os
 from collections import namedtuple
 from collections.abc import Iterable
 import numpy as np
@@ -15,6 +15,8 @@ Tensor = namedtuple('Tensor', ['shape', 'dtype'])
 Multi-dimensional array descriptions: `shape` and `dtype`
 '''
 
+# allow users to select which keras implementation to use
+USE_TF_KERAS = bool(int(os.getenv('USE_TF_KERAS', '0')))
 
 class Scope:
     '''
