@@ -120,7 +120,7 @@ class LambdaTransformer(BaseTaskTransformer):
             name_: fill_value(dtype) for name_, shape, dtype in fields
         }
         # select which value in the event of multiple values in interval
-        self.SAMPLE_INDEX = sample_index
+        self.sample_index = sample_index
 
     # Either override by passing a function like `__init__(reduce=lambda x: ...)`
     # or by overriding with a subclass.
@@ -146,8 +146,9 @@ class LambdaTransformer(BaseTaskTransformer):
         if self.multi:
             target_vals = ([values[j] for j in i] for i in idxs)
         else:
-            target_vals = (values[i[self.SAMPLE_INDEX]]
-                           if len(i) else None for i in idxs)
+            target_vals = (values[i[self.sample_index]]
+                           if len(i) or isinstance(self.sample_index, slice)
+                           else None for i in idxs)
 
         # reduce into a data dict for each interval
         data = [dict(self.FILL_DICT, **{
