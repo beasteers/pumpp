@@ -11,6 +11,8 @@ from .. import util
 
 __all__ = ['LambdaTransformer']
 
+EVENT_NS = {'onset', }
+
 class LambdaTransformer(BaseTaskTransformer):
     '''General annotation transformer.
     This tries to offer a flexible way of extracting jams observation values.
@@ -94,10 +96,18 @@ class LambdaTransformer(BaseTaskTransformer):
     '''
 
     def __init__(self, name, namespace, fields=(), query=None, reduce=None,
-                 multi=False, sample_index=-1, **kw):
+                 multi=False, sample_index=None, mode=None,
+                 event_duration=None, event_center=True,
+                 window_shift=None, **kw):
         super().__init__(name, namespace, **kw)
         self.value_query = query
         self.multi = multi
+        self.mode = mode or (
+            'events' if namespace in EVENT_NS and not event_duration
+            else 'intervals')
+        self.event_duration = event_duration or 0
+        self.event_center = event_center
+        self.window_shift = window_shift
 
         # infer missing fields / dtype for missing reducer
         fields, value_has_defined_keys = _check_fields(fields, namespace, multi)
@@ -120,7 +130,9 @@ class LambdaTransformer(BaseTaskTransformer):
             name_: fill_value(dtype) for name_, shape, dtype in fields
         }
         # select which value in the event of multiple values in interval
-        self.sample_index = sample_index
+        self.sample_index = (
+            (slice(None) if multi else -1)
+            if sample_index is None else sample_index)
 
     # Either override by passing a function like `__init__(reduce=lambda x: ...)`
     # or by overriding with a subclass.
@@ -128,48 +140,95 @@ class LambdaTransformer(BaseTaskTransformer):
 
     def transform_annotation(self, ann, duration):
         # get observations as lists
-        intervals, values = ann.to_interval_values()
+        if self.mode == 'events':
+            intervals, values = ann.to_event_values()
+        else:
+            intervals, values = ann.to_interval_values()
+            # convert any events to an interval, if applicable
+            intervals = self.convert_events_to_intervals(intervals)
+        # filter intervals by query
+        intervals, values = self.query_intervals(intervals, values)
+        # slice values into each time bin and apply reducer
+        return self.reduce_temporal_slices(intervals, values, duration)
 
+    def convert_events_to_intervals(self, intervals):
+        '''Convert an event to an interval, either centered, or left-aligned.'''
+        if self.event_duration:
+            intervals = set_event_interval(
+                intervals, self.event_duration, self.event_center)
+        return np.asarray(intervals) - (self.window_shift or 0)
+
+    def query_intervals(self, intervals, values):
         # filter values that match query
         matches = [(i, d) for i, d in zip(intervals, values)
                    if util.match_query(d, self.value_query)]
         intervals, values = zip(*matches) if matches else ((), ())
+        return intervals, values
 
+    def encode_temporal_slices(self, intervals, values, duration):
         # get temporal slices, using one hot observation encoding
-        idxs = np.eye(len(intervals))
-        targets = self.encode_intervals(duration, intervals, idxs,
-                                        multi=True, dtype=int, fill=0)
-
-        # get the values in each interval window
-        idxs = (np.where(i)[0] for i in targets)
-
-        if self.multi:
-            target_vals = ([values[j] for j in i] for i in idxs)
+        intervals = np.asarray(intervals)
+        if intervals.ndim == 1:
+            targets = self.encode_events(
+                duration, intervals, np.eye(len(intervals)))
         else:
-            target_vals = (values[i[self.sample_index]]
-                           if len(i) or isinstance(self.sample_index, slice)
-                           else None for i in idxs)
+            targets = self.encode_intervals(
+                duration, intervals, np.eye(len(intervals)), multi=True)
 
+        # slice values using the event/interval incoding and the
+        # chosen sample index/slice.
+        values = np.asarray(values)
+        isslice = isinstance(self.sample_index, slice)
+        return [
+            v[self.sample_index] if len(v) or isslice else None
+            for v in (values[i] for i in targets)
+        ]
+
+    def reduce_temporal_slices(self, intervals, values, duration, reducer=None):
         # reduce into a data dict for each interval
+        reducer = reducer if reducer is not None else self.reducer
         data = [dict(self.FILL_DICT, **{
-            k: v for k, v in self.reducer(e).items()
+            k: v for k, v in reducer(e).items()
             if v is not None
-        }) for e in target_vals]
+        }) for e in self.encode_temporal_slices(intervals, values, duration)]
 
         # merge the list of dicts into a dict of lists/arrays
+        # fill missing with zero
         return {
-            key: np.array([np.asarray(d[key]) for d in data])
+            key: np.array([np.asarray(d.get(key, 0)) for d in data])
             for key in set().union(*data)
         }
 
     def inverse(self, x, duration=None):
-        raise NotImplementedError('Lambda annotations cannot be inverted')
+        raise NotImplementedError('Lambda annotations are not implicitly invertable.')
+
+    @property
+    def target_window_shift(self):
+        return (self.window_shift or 0) + (
+            (self.event_duration or 0 if self.event_center else 0) / 2)
+
+    # def only_registered(self, data, require_all=False):
+    #     return {
+    #         k: data[k] for k in (
+    #             self.fields if require_all
+    #             else set(self.fields) & set(data))
+    #     }
 
 
 
 ############
 # Utilities
 ############
+
+def set_event_interval(intervals, duration=1, center=True):
+    w1, w2 = (duration/2.,)*2 if center else (0, duration)
+    intervals = [
+        (x,)*2 if isinstance(x, (float, int)) else x for x in intervals]
+    return [
+        (t1 - w1, t2 + w2) if t1 == t2 else (t1, t2)
+        for t1, t2 in intervals
+    ]
+
 
 # Mapping of js primitives to numpy types
 __TYPE_MAP__ = dict(integer=np.int_,
@@ -253,11 +312,8 @@ def _check_fields(fields, namespace, multi=False):
     '''
     schema = jams.schema.namespace(namespace)
     value_type, _ = jams.schema.get_dtypes(namespace)
-
-    if isinstance(fields, str):
-        fields = [fields]
-    else:
-        fields = list(fields)
+    # coerce fields to list
+    fields = [fields] if isinstance(fields, str) else list(fields)
 
     # get object field dtypes
     try:
@@ -268,38 +324,32 @@ def _check_fields(fields, namespace, multi=False):
         }
         # NOTE: cannot use value_type because other things map to np.object_
         value_has_defined_keys = (
-            valschema['type'] == 'object' and 'properties' in valschema)
+            valschema['type'] == 'object'
+            and 'properties' in valschema)
     except KeyError:
         value_has_defined_keys = False
         dtypes = {}
 
     # get default shape
-    if multi:
-        default_shape = (None, None)
-    else:
-        default_shape = (None,)
+    default_shape = (None, None) if multi else (None,)
 
-    if dtypes:
-        # set default fields as all object props
-        if not fields:
-            fields = [(name, default_shape, dtype)
-                      for name, dtype in dtypes.items()]
-
+    if fields:
         # check if any fields were passed as strings and try to infer
         # them from the schema
-        else:
-            for i, f in enumerate(fields):
-                if isinstance(f, str):
-                    fields[i] = (f, default_shape, dtypes[f])
+        # if no namespace dtypes, assume they are all the same type as value.
+        fields = [
+            (f, default_shape, dtypes[f] if dtypes else value_type)
+            if isinstance(f, str) else f
+            for f in fields
+        ]
     else:
-        # if no fields specified and no value object keys, set a single default field
-        if not fields:
-            fields = [(namespace, default_shape, value_type)]
-        # check for fields defined as strings. assume they are all the same type as value.
-        else:
-            for i, f in enumerate(fields):
-                if isinstance(f, str):
-                    fields[i] = (f, default_shape, value_type)
+        # set default fields as all object props
+        # if no fields specified and no value object keys,
+        # set a single default field, namespace.
+        fields = [
+            (name, default_shape, dtype)
+            for name, dtype in (dtypes or {namespace: value_type}).items()
+        ]
 
     # double check that everything looks how we want it.
     assert fields, 'at least one field must be defined.'
